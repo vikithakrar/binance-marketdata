@@ -6,7 +6,7 @@
 #include <optional>
 #include <string>
 
-namespace binance::futures {
+namespace marketdata {
 
 enum class UpdateKind {
     Book,
@@ -44,4 +44,4 @@ struct MarketData {
     std::optional<TradeInfo> last_trade;
 };
 
-} // namespace binance::futures
+} // namespace marketdata

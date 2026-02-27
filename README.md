@@ -1,29 +1,28 @@
-# Binance USDM Futures Low-Latency Market Data Connector (C++)
+# Low-Latency Market Data Connector (C++)
 
-This connector maintains parallel websocket sessions and emits a **generic** market data payload.
+This project now follows a **multi-exchange adapter architecture**:
 
-- low-overhead JSON decode path using `Boost.JSON` parser reuse (thread-local parser) for reduced per-message allocations
+- `connectors::Connector` is transport/runtime orchestration (IO threads, websocket sessions, reconnects).
+- You can now pass one or many adapters at construction time.
+- `connectors::ExchangeAdapter` is venue-specific behavior (host/port, stream path, message mapping).
+- `marketdata::MarketData` remains generic and market-agnostic.
 
-## What the callback receives
+Current implementation includes a production adapter for **Binance USDⓈ-M Futures** (`binance::futures::Adapter`).
 
-`binance::futures::MarketData` is market-agnostic and always carries:
+## Architecture
 
-- `venue` and `instrument`
-- event timestamp + sequence
-- a **constructed top-5 order book snapshot** (`bids` / `asks`) maintained from streaming updates
-- optional `last_trade` when the event is trade-driven
+- Generic connector core parses incoming websocket JSON using thread-local `boost::json::parser` reuse.
+- Adapter handles venue stream semantics and converts payloads into generic `marketdata::MarketData`.
+- In-memory top-5 book snapshot is maintained in the Binance Futures adapter.
+- Connector can fan out parallel sessions across resolved exchange IP endpoints with auto-reconnect.
 
-The order book is continuously updated from `depth@0ms` deltas (and optionally bookTicker updates) and emitted as a constructed snapshot for every callback.
+## Key APIs
 
-## Subscriptions
-
-Config supports enabling:
-
-- `bookTicker`
-- `depth@0ms`
-- `trade`
-
-and setting symbol list, parallel connection count, and IO thread count.
+- `include/market_data.hpp`: generic market data payload.
+- `include/connector.hpp`:
+  - `connectors::ExchangeAdapter` (adapter interface)
+  - `connectors::Connector` (generic connector runtime)
+  - `binance::futures::Adapter` + `binance::futures::AdapterConfig` (venue adapter)
 
 ## Build
 
@@ -37,17 +36,3 @@ cmake --build build -j
 ```bash
 ./build/binance_connector_demo
 ```
-
-## Main APIs
-
-- `include/market_data.hpp`: generic callback payload (constructed top-5 order book + optional trade)
-- `include/binance_usdm_connector.hpp`: connector config and lifecycle API
-- `src/binance_usdm_connector.cpp`: websocket sessions, delta-to-book construction, dedup, callback emission
-
-
-## Latency-oriented implementation notes
-
-- Uses `boost::json::parser` with thread-local reuse to minimize JSON allocation churn on the hot path.
-- Keeps in-memory order book state and emits pre-constructed top-5 snapshots directly from maintained maps.
-- Uses fast numeric conversion (`strtod`) for string-encoded price/qty fields common in Binance payloads.
-- Maintains parallel websocket sessions with fast reconnect backoff and stream-sequence deduplication.

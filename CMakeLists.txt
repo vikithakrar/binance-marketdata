@@ -10,7 +10,7 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(binance_connector
-    src/binance_usdm_connector.cpp
+    src/connector.cpp
 )
 
 target_include_directories(binance_connector

@@ -1,9 +1,10 @@
-#include "binance_usdm_connector.hpp"
+#include "connector.hpp"
 
 #include <atomic>
 #include <csignal>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <thread>
 
 namespace {
@@ -11,11 +12,11 @@ std::atomic_bool keep_running {true};
 
 void signal_handler(int) { keep_running = false; }
 
-const char* kind_name(binance::futures::UpdateKind kind) {
+const char* kind_name(marketdata::UpdateKind kind) {
     switch (kind) {
-    case binance::futures::UpdateKind::Book:
+    case marketdata::UpdateKind::Book:
         return "book";
-    case binance::futures::UpdateKind::Trade:
+    case marketdata::UpdateKind::Trade:
         return "trade";
     }
     return "unknown";
@@ -26,16 +27,20 @@ int main() {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    binance::futures::Connector::Config cfg;
-    cfg.symbols = {"BTCUSDT", "ETHUSDT"};
-    cfg.parallel_connections = 2;
-    cfg.io_threads = 2;
-    cfg.subscribe_book_ticker = true;
-    cfg.subscribe_depth_0ms = true;
-    cfg.subscribe_trade = true;
+    binance::futures::AdapterConfig adapter_cfg;
+    adapter_cfg.symbols = {"BTCUSDT", "ETHUSDT"};
+    adapter_cfg.subscribe_book_ticker = true;
+    adapter_cfg.subscribe_depth_0ms = true;
+    adapter_cfg.subscribe_trade = true;
 
-    binance::futures::Connector connector(cfg);
-    connector.start([](const binance::futures::MarketData& md) {
+    connectors::Connector::RuntimeConfig runtime_cfg;
+    runtime_cfg.parallel_connections = 2;
+    runtime_cfg.io_threads = 2;
+
+    auto adapter = std::make_unique<binance::futures::Adapter>(adapter_cfg);
+    connectors::Connector connector(runtime_cfg, std::move(adapter));
+
+    connector.start([](const marketdata::MarketData& md) {
         std::cout << std::fixed << std::setprecision(8)
                   << "venue=" << md.venue
                   << " instrument=" << md.instrument
@@ -53,8 +58,7 @@ int main() {
         }
 
         if (md.last_trade.has_value()) {
-            std::cout << " trade=" << md.last_trade->price
-                      << " qty=" << md.last_trade->qty
+            std::cout << " trade=" << md.last_trade->price << " qty=" << md.last_trade->qty
                       << " maker=" << (md.last_trade->buyer_is_maker ? "1" : "0");
         }
         std::cout << '\n';
