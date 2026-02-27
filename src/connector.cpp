@@ -9,15 +9,16 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/json.hpp>
+#include <boost/lockfree/queue.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -77,8 +78,6 @@ struct Adapter::Impl {
     };
 
     AdapterConfig config;
-    std::mutex book_mutex;
-    std::mutex dedup_mutex;
     std::unordered_map<std::string, std::int64_t> max_source_id_by_stream;
     std::unordered_map<std::string, BookState> books;
 };
@@ -113,11 +112,9 @@ std::string Adapter::stream_path() const {
 
 namespace {
 
-bool should_emit(std::mutex& mutex,
-                 std::unordered_map<std::string, std::int64_t>& max_source_id_by_stream,
+bool should_emit(std::unordered_map<std::string, std::int64_t>& max_source_id_by_stream,
                  const std::string& key,
                  std::int64_t sequence) {
-    std::scoped_lock lock(mutex);
     auto& last = max_source_id_by_stream[key];
     if (sequence <= last) return false;
     last = sequence;
@@ -183,11 +180,8 @@ std::optional<connectors::MarketData> Adapter::on_message(std::string_view strea
 
     if (stream.find("@depth@0ms") != std::string_view::npos) {
         const auto update_id = get_i64(data, "u");
-        if (!should_emit(impl_->dedup_mutex, impl_->max_source_id_by_stream, symbol + "@depth", update_id)) {
-            return std::nullopt;
-        }
+        if (!should_emit(impl_->max_source_id_by_stream, symbol + "@depth", update_id)) return std::nullopt;
 
-        std::scoped_lock lock(impl_->book_mutex);
         auto& book = impl_->books[symbol];
         book.last_update_id = update_id;
         apply_levels(book.bids, data, "b");
@@ -205,9 +199,7 @@ std::optional<connectors::MarketData> Adapter::on_message(std::string_view strea
 
     if (stream.ends_with("@trade")) {
         const auto trade_id = get_i64(data, "t");
-        if (!should_emit(impl_->dedup_mutex, impl_->max_source_id_by_stream, symbol + "@trade", trade_id)) {
-            return std::nullopt;
-        }
+        if (!should_emit(impl_->max_source_id_by_stream, symbol + "@trade", trade_id)) return std::nullopt;
 
         connectors::MarketData md{};
         md.venue = "binance";
@@ -217,7 +209,6 @@ std::optional<connectors::MarketData> Adapter::on_message(std::string_view strea
         md.kind = connectors::UpdateKind::Trade;
         md.last_trade = connectors::TradeInfo{trade_id, get_double(data, "p"), get_double(data, "q"), get_bool(data, "m")};
 
-        std::scoped_lock lock(impl_->book_mutex);
         auto it = impl_->books.find(symbol);
         if (it != impl_->books.end()) fill_top_levels(it->second.bids, it->second.asks, md);
         return md;
@@ -225,11 +216,8 @@ std::optional<connectors::MarketData> Adapter::on_message(std::string_view strea
 
     if (stream.ends_with("@bookTicker")) {
         const auto update_id = get_i64(data, "u");
-        if (!should_emit(impl_->dedup_mutex, impl_->max_source_id_by_stream, symbol + "@bookTicker", update_id)) {
-            return std::nullopt;
-        }
+        if (!should_emit(impl_->max_source_id_by_stream, symbol + "@bookTicker", update_id)) return std::nullopt;
 
-        std::scoped_lock lock(impl_->book_mutex);
         auto& book = impl_->books[symbol];
         book.last_update_id = std::max(book.last_update_id, update_id);
 
@@ -273,7 +261,8 @@ public:
         : ioc_(static_cast<int>(std::max<std::size_t>(1, runtime_config.io_threads))),
           work_guard_(asio::make_work_guard(ioc_)),
           ssl_ctx_(asio::ssl::context::tlsv12_client),
-          runtime_config_(runtime_config) {
+          runtime_config_(runtime_config),
+          event_queue_(65536) {
         ssl_ctx_.set_default_verify_paths();
         ssl_ctx_.set_verify_mode(asio::ssl::verify_peer);
 
@@ -286,15 +275,18 @@ public:
     ~Impl() {
         stop();
         shutdown_io();
+        drain_queue();
     }
 
     void start(MarketDataCallback callback) {
-        std::scoped_lock lock(state_mutex_);
         callback_ = std::move(callback);
         if (!io_threads_started_) {
             start_io_threads();
         }
-        stopped_ = false;
+
+        stopped_.store(false, std::memory_order_release);
+
+        polling_thread_ = std::thread([this]() { polling_loop(); });
 
         for (std::size_t i = 0; i < adapter_runtimes_.size(); ++i) {
             adapter_runtimes_[i]->sessions.clear();
@@ -303,27 +295,35 @@ public:
     }
 
     void stop() {
-        std::vector<std::shared_ptr<WebsocketSession>> sessions;
-        {
-            std::scoped_lock lock(state_mutex_);
-            if (stopped_) return;
-            stopped_ = true;
+        if (stopped_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
 
-            for (auto& runtime : adapter_runtimes_) {
-                beast::error_code ignored;
-                runtime->resolver.cancel();
-                runtime->resolve_retry_timer.cancel(ignored);
-                sessions.insert(sessions.end(), runtime->sessions.begin(), runtime->sessions.end());
-                runtime->sessions.clear();
-            }
+        std::vector<std::shared_ptr<WebsocketSession>> sessions;
+        for (auto& runtime : adapter_runtimes_) {
+            beast::error_code ignored;
+            runtime->resolver.cancel();
+            runtime->resolve_retry_timer.cancel(ignored);
+            sessions.insert(sessions.end(), runtime->sessions.begin(), runtime->sessions.end());
+            runtime->sessions.clear();
         }
 
         for (auto& s : sessions) {
             s->stop();
         }
+
+        if (polling_thread_.joinable()) {
+            polling_thread_.join();
+        }
     }
 
 private:
+    struct ParsedEvent {
+        std::size_t adapter_index {};
+        std::string stream;
+        json::object data;
+    };
+
     class WebsocketSession;
 
     struct AdapterRuntime {
@@ -416,7 +416,7 @@ private:
         }
 
         void schedule_reconnect(std::string_view stage, beast::error_code ec) {
-            if (owner_.stopped_) return;
+            if (owner_.stopped_.load(std::memory_order_acquire)) return;
             std::cerr << "adapter=" << adapter_index_ << " session=" << session_id_ << " endpoint=" << endpoint_
                       << " stage=" << stage << " error=" << ec.message() << '\n';
 
@@ -426,7 +426,7 @@ private:
             reconnect_timer_.expires_after(std::chrono::milliseconds(150));
             auto self = shared_from_this();
             reconnect_timer_.async_wait([self](beast::error_code timer_ec) {
-                if (timer_ec || self->owner_.stopped_) return;
+                if (timer_ec || self->owner_.stopped_.load(std::memory_order_acquire)) return;
                 self->connect();
             });
         }
@@ -455,18 +455,18 @@ private:
     }
 
     void schedule_resolve_retry(std::size_t adapter_index, beast::error_code ec) {
-        if (stopped_) return;
+        if (stopped_.load(std::memory_order_acquire)) return;
         std::cerr << "adapter=" << adapter_index << " resolve failed error=" << ec.message() << '\n';
         auto& timer = adapter_runtimes_[adapter_index]->resolve_retry_timer;
         timer.expires_after(std::chrono::milliseconds(300));
         timer.async_wait([this, adapter_index](beast::error_code timer_ec) {
-            if (timer_ec || stopped_) return;
+            if (timer_ec || stopped_.load(std::memory_order_acquire)) return;
             resolve_and_connect(adapter_index);
         });
     }
 
     void connect_to_all_endpoints(std::size_t adapter_index, const tcp::resolver::results_type& results) {
-        if (stopped_) return;
+        if (stopped_.load(std::memory_order_acquire)) return;
 
         std::vector<tcp::endpoint> endpoints;
         std::set<std::string> uniq;
@@ -490,19 +490,10 @@ private:
         for (std::size_t i = 0; i < fanout; ++i) {
             const auto& ep = endpoints[i % endpoints.size()];
             new_sessions.push_back(std::make_shared<WebsocketSession>(
-                *this,
-                adapter_index,
-                stream_path,
-                host,
-                ep,
-                static_cast<std::uint32_t>(i)));
+                *this, adapter_index, stream_path, host, ep, static_cast<std::uint32_t>(i)));
         }
 
-        {
-            std::scoped_lock lock(state_mutex_);
-            runtime.sessions = new_sessions;
-        }
-
+        runtime.sessions = new_sessions;
         for (auto& s : new_sessions) s->start();
     }
 
@@ -538,14 +529,46 @@ private:
             if (stream_it == obj.end() || data_it == obj.end()) return;
             if (!stream_it->value().is_string() || !data_it->value().is_object()) return;
 
+            auto* event = new ParsedEvent;
+            event->adapter_index = adapter_index;
             const auto stream_sv = stream_it->value().as_string();
-            const std::string_view stream(stream_sv.data(), stream_sv.size());
-            const auto maybe_md = adapter_runtimes_[adapter_index]->adapter->on_message(stream, data_it->value().as_object());
+            event->stream.assign(stream_sv.data(), stream_sv.size());
+            event->data = data_it->value().as_object();
 
-            if (maybe_md.has_value() && callback_) callback_(*maybe_md);
+            while (!stopped_.load(std::memory_order_acquire) && !event_queue_.push(event)) {
+            }
+            if (stopped_.load(std::memory_order_acquire)) {
+                delete event;
+            }
         } catch (const std::exception& ex) {
             std::cerr << "decode error adapter=" << adapter_index << " session=" << session_id
                       << " message=" << ex.what() << '\n';
+        }
+    }
+
+    void polling_loop() {
+        while (!stopped_.load(std::memory_order_acquire) || !event_queue_.empty()) {
+            ParsedEvent* event = nullptr;
+            if (!event_queue_.pop(event)) {
+                continue;
+            }
+
+            std::unique_ptr<ParsedEvent> holder(event);
+            if (holder->adapter_index >= adapter_runtimes_.size()) {
+                continue;
+            }
+
+            const auto maybe_md = adapter_runtimes_[holder->adapter_index]->adapter->on_message(holder->stream, holder->data);
+            if (maybe_md.has_value() && callback_) {
+                callback_(*maybe_md);
+            }
+        }
+    }
+
+    void drain_queue() {
+        ParsedEvent* event = nullptr;
+        while (event_queue_.pop(event)) {
+            delete event;
         }
     }
 
@@ -555,10 +578,11 @@ private:
     RuntimeConfig runtime_config_;
     std::vector<std::unique_ptr<AdapterRuntime>> adapter_runtimes_;
     MarketDataCallback callback_;
-    bool stopped_ {true};
+    std::atomic_bool stopped_ {true};
     bool io_threads_started_ {false};
     std::vector<std::thread> io_threads_;
-    std::mutex state_mutex_;
+    std::thread polling_thread_;
+    boost::lockfree::queue<ParsedEvent*> event_queue_;
 };
 
 Connector::Connector(RuntimeConfig runtime_config, std::unique_ptr<ExchangeAdapter> adapter) {
